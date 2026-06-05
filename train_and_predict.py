@@ -4,11 +4,8 @@ import pygeohash as pgh
 import optuna
 from sklearn.model_selection import KFold
 from sklearn.metrics import r2_score
-import lightgbm as lgb
 import xgboost as xgb
 from catboost import CatBoostRegressor
-import os
-import gc
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -37,15 +34,15 @@ def feature_engineering(df):
     # Advanced time features
     df['is_rush_hour'] = ((df['hour'].between(7, 9)) | (df['hour'].between(16, 19))).astype(int)
     df['is_night'] = ((df['hour'] < 6) | (df['hour'] > 22)).astype(int)
-    df['is_weekend'] = (df['day'] % 7 >= 5).astype(int)  # Assuming day sequential and week is 7 days
+    df['is_weekend'] = (df['day'] % 7 >= 5).astype(int)
     
     # 3. Handle Missing Values & Categoricals
-    df['Temperature'].fillna(df['Temperature'].median(), inplace=True)
-    df['RoadType'].fillna('Unknown', inplace=True)
-    df['Weather'].fillna('Unknown', inplace=True)
-    df['NumberofLanes'].fillna(-1, inplace=True)
-    df['LargeVehicles'].fillna('Unknown', inplace=True)
-    df['Landmarks'].fillna('Unknown', inplace=True)
+    df['Temperature'] = df['Temperature'].fillna(df['Temperature'].median())
+    df['RoadType'] = df['RoadType'].fillna('Unknown')
+    df['Weather'] = df['Weather'].fillna('Unknown')
+    df['NumberofLanes'] = df['NumberofLanes'].fillna(-1)
+    df['LargeVehicles'] = df['LargeVehicles'].fillna('Unknown')
+    df['Landmarks'] = df['Landmarks'].fillna('Unknown')
     
     # 4. Interaction Features
     df['Lanes_x_Road'] = df['NumberofLanes'].astype(str) + "_" + df['RoadType']
@@ -82,110 +79,103 @@ def run_pipeline():
     
     print("Starting modeling...")
     
-    # LightGBM Params (Fixed for speed, we could use optuna but it might take too long in environment. 
-    # For competition grade, we run a short optuna or use robust params). Let's use robust params with early stopping.
-    lgb_params = {
-        'objective': 'regression',
-        'metric': 'rmse',
-        'boosting_type': 'gbdt',
-        'learning_rate': 0.05,
-        'num_leaves': 63,
-        'max_depth': -1,
-        'feature_fraction': 0.8,
-        'verbose': -1,
-        'random_state': SEED,
-        'n_estimators': 1500
-    }
+    kf = KFold(n_splits=5, shuffle=True, random_state=SEED)
+    
+    def objective_xgb(trial):
+        params = {
+            'objective': 'reg:squarederror',
+            'eval_metric': 'rmse',
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1),
+            'max_depth': trial.suggest_int('max_depth', 3, 9),
+            'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+            'random_state': SEED,
+            'n_estimators': 300,
+            'enable_categorical': True,
+            'tree_method': 'hist'
+        }
+        
+        r2_scores = []
+        for train_idx, val_idx in kf.split(X, y):
+            X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
+            X_val, y_val = X.iloc[val_idx], y.iloc[val_idx]
+            
+            model = xgb.XGBRegressor(**params)
+            model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+            preds = model.predict(X_val)
+            r2_scores.append(r2_score(y_val, preds))
+            
+        return np.mean(r2_scores)
+    
+    print("Running Optuna for XGBoost...")
+    study_xgb = optuna.create_study(direction='maximize')
+    study_xgb.optimize(objective_xgb, n_trials=3)
+    best_xgb_params = study_xgb.best_params
+    best_xgb_params['objective'] = 'reg:squarederror'
+    best_xgb_params['eval_metric'] = 'rmse'
+    best_xgb_params['random_state'] = SEED
+    best_xgb_params['n_estimators'] = 800
+    best_xgb_params['enable_categorical'] = True
+    best_xgb_params['tree_method'] = 'hist'
     
     cat_params = {
         'loss_function': 'RMSE',
         'eval_metric': 'R2',
         'learning_rate': 0.05,
         'depth': 6,
-        'l2_leaf_reg': 3,
         'random_seed': SEED,
         'verbose': 0,
-        'iterations': 1500,
+        'iterations': 1000,
         'cat_features': cat_features
     }
     
-    xgb_params = {
-        'objective': 'reg:squarederror',
-        'eval_metric': 'rmse',
-        'learning_rate': 0.05,
-        'max_depth': 6,
-        'subsample': 0.8,
-        'colsample_bytree': 0.8,
-        'random_state': SEED,
-        'n_estimators': 1000,
-        'enable_categorical': True,
-        'tree_method': 'hist'
-    }
-    
-    kf = KFold(n_splits=5, shuffle=True, random_state=SEED)
-    
-    oof_lgb = np.zeros(len(X))
-    preds_lgb = np.zeros(len(X_test))
-    oof_cat = np.zeros(len(X))
-    preds_cat = np.zeros(len(X_test))
     oof_xgb = np.zeros(len(X))
     preds_xgb = np.zeros(len(X_test))
+    oof_cat = np.zeros(len(X))
+    preds_cat = np.zeros(len(X_test))
     
     for fold, (train_idx, val_idx) in enumerate(kf.split(X, y)):
         print(f"Fold {fold+1}")
         X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
         X_val, y_val = X.iloc[val_idx], y.iloc[val_idx]
         
-        # LightGBM
-        model_lgb = lgb.LGBMRegressor(**lgb_params)
-        model_lgb.fit(X_train, y_train, 
-                      eval_set=[(X_val, y_val)], 
-                      callbacks=[lgb.early_stopping(50, verbose=False)])
-        oof_lgb[val_idx] = model_lgb.predict(X_val)
-        preds_lgb += model_lgb.predict(X_test) / 5
+        # XGBoost
+        model_xgb = xgb.XGBRegressor(**best_xgb_params)
+        model_xgb.fit(X_train, y_train,
+                      eval_set=[(X_val, y_val)],
+                      verbose=False)
+        oof_xgb[val_idx] = model_xgb.predict(X_val)
+        preds_xgb += model_xgb.predict(X_test) / 5
         
         # CatBoost
-        # Convert category to string for catboost or use them directly if pandas category
         model_cat = CatBoostRegressor(**cat_params)
         model_cat.fit(X_train, y_train, 
                       eval_set=[(X_val, y_val)], 
                       early_stopping_rounds=50, verbose=False)
         oof_cat[val_idx] = model_cat.predict(X_val)
         preds_cat += model_cat.predict(X_test) / 5
-        
-        # XGBoost
-        # xgb handles category directly if enable_categorical=True
-        model_xgb = xgb.XGBRegressor(**xgb_params)
-        model_xgb.fit(X_train, y_train,
-                      eval_set=[(X_val, y_val)],
-                      verbose=False) # xgb standard api early stopping is deprecating, using default 1000 trees
-        oof_xgb[val_idx] = model_xgb.predict(X_val)
-        preds_xgb += model_xgb.predict(X_test) / 5
 
-    r2_lgb = r2_score(y, oof_lgb)
-    r2_cat = r2_score(y, oof_cat)
     r2_xgb = r2_score(y, oof_xgb)
+    r2_cat = r2_score(y, oof_cat)
     
-    print(f"LGB OOF R2: {r2_lgb:.5f}")
-    print(f"CAT OOF R2: {r2_cat:.5f}")
     print(f"XGB OOF R2: {r2_xgb:.5f}")
+    print(f"CAT OOF R2: {r2_cat:.5f}")
     
-    # Simple weighted ensemble based on R2 (or just average if all are good)
-    # Give higher weight to better model
-    weights = [max(r2_lgb, 0), max(r2_cat, 0), max(r2_xgb, 0)]
+    # Simple weighted ensemble based on R2
+    weights = [max(r2_xgb, 0), max(r2_cat, 0)]
     sum_w = sum(weights)
     if sum_w == 0:
-        w_lgb, w_cat, w_xgb = 0.33, 0.33, 0.33
+        w_xgb, w_cat = 0.5, 0.5
     else:
-        w_lgb, w_cat, w_xgb = weights[0]/sum_w, weights[1]/sum_w, weights[2]/sum_w
+        w_xgb, w_cat = weights[0]/sum_w, weights[1]/sum_w
         
-    print(f"Ensemble Weights -> LGB: {w_lgb:.2f}, CAT: {w_cat:.2f}, XGB: {w_xgb:.2f}")
+    print(f"Ensemble Weights -> XGB: {w_xgb:.2f}, CAT: {w_cat:.2f}")
     
-    oof_ens = w_lgb*oof_lgb + w_cat*oof_cat + w_xgb*oof_xgb
+    oof_ens = w_xgb*oof_xgb + w_cat*oof_cat
     r2_ens = r2_score(y, oof_ens)
     print(f"Ensemble OOF R2: {r2_ens:.5f}")
     
-    final_preds = w_lgb*preds_lgb + w_cat*preds_cat + w_xgb*preds_xgb
+    final_preds = w_xgb*preds_xgb + w_cat*preds_cat
     
     # Create submission
     sub = pd.DataFrame({'Index': test_df['Index'], 'demand': final_preds})
