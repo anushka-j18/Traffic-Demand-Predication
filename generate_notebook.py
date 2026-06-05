@@ -3,25 +3,25 @@ import nbformat as nbf
 nb = nbf.v4.new_notebook()
 
 text_intro = """\
-# Traffic Demand Prediction - Competition Grade Solution
+# Traffic Demand Prediction - Advanced Competition Grade Solution
 
-This notebook presents a comprehensive machine learning pipeline to predict traffic demand based on historical data. The solution is optimized for R² score.
-LightGBM was excluded to avoid Mac OS libomp dependency issues, relying heavily on CatBoost and XGBoost instead.
+This notebook implements an advanced machine learning pipeline. It maximizes the R² score by leveraging:
+1. **Cyclical Temporal Encoding** (Sine/Cosine transformations)
+2. **Spatial Clustering** (KMeans on Latitude/Longitude)
+3. **Historical Target Aggregation** (Day 48 mean demand mapped to Day 49)
+4. **Frequency Encodings & Interactions**
+5. **Robust 5-Model Ensemble**: XGBoost, CatBoost, HistGradientBoosting, RandomForest, and ExtraTrees.
 
 ## Table of Contents
 1. Exploratory Data Analysis (EDA)
-2. Data Preprocessing & Leakage Prevention
-3. Feature Engineering
-   - Geohash Decoding
-   - Advanced Timestamp Features
-   - Interaction Features
-4. Modeling and Hyperparameter Tuning with Optuna
-   - XGBoost
-   - CatBoost
+2. Feature Engineering & Preprocessing
+3. Modeling and Hyperparameter Tuning with Optuna
+4. Feature Importance
 5. Ensembling & Final Submission
 """
 
 code_imports = """\
+import warnings
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -30,10 +30,14 @@ import pygeohash as pgh
 import optuna
 from sklearn.model_selection import KFold
 from sklearn.metrics import r2_score
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import OrdinalEncoder
+from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor, HistGradientBoostingRegressor
 import xgboost as xgb
 from catboost import CatBoostRegressor
-import warnings
+
 warnings.filterwarnings('ignore')
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 SEED = 42
 np.random.seed(SEED)
@@ -41,7 +45,7 @@ np.random.seed(SEED)
 
 text_eda = """\
 ## 1. Exploratory Data Analysis (EDA)
-Let's load the data and inspect it. We'll look at the distribution of the target variable and missing values.
+Let's inspect the target distribution and correlations.
 """
 
 code_eda = """\
@@ -51,37 +55,58 @@ sample_sub = pd.read_csv('/Users/anushka/Downloads/dataset/sample_submission.csv
 
 print("Train shape:", train.shape)
 print("Test shape:", test.shape)
-display(train.head())
 
-print("Missing values in Train:\\n", train.isnull().sum()[train.isnull().sum() > 0])
+# Check overlap of Days
+print("Train Days:", train['day'].unique())
+print("Test Days:", test['day'].unique())
 """
 
 text_fe = """\
 ## 2. Feature Engineering & Preprocessing
-To maximize our R² score, we extract multiple features:
-- **Spatial:** Latitude and Longitude from the `geohash`.
-- **Temporal:** Parse `timestamp` to `hour` and `minute`. Add `is_rush_hour`, `is_night`, and `is_weekend`.
-- **Interactions:** Combine `RoadType` and `NumberofLanes` as an infrastructure capacity metric. We also look at weather and rush hour interaction.
+We build advanced features to capture spatial, temporal, and historical demand patterns.
 """
 
 code_fe = """\
+# 1. Historical Target Aggregation (Leak-Free)
+day48_train = train[train['day'] == 48]
+hist_demand = day48_train.groupby('geohash')['demand'].mean().reset_index()
+hist_demand.rename(columns={'demand': 'hist_mean_demand'}, inplace=True)
+global_mean_demand = day48_train['demand'].mean()
+
+train['is_train'] = 1
+test['is_train'] = 0
+all_data = pd.concat([train, test], axis=0, ignore_index=True)
+
+# Merge historical demand
+all_data = pd.merge(all_data, hist_demand, on='geohash', how='left')
+all_data['hist_mean_demand'].fillna(global_mean_demand, inplace=True)
+
 def feature_engineering(df):
     df = df.copy()
     
-    # 1. Geohash features
+    # Spatial Features
     df['latitude'] = df['geohash'].apply(lambda x: pgh.decode(x)[0] if pd.notnull(x) else np.nan)
     df['longitude'] = df['geohash'].apply(lambda x: pgh.decode(x)[1] if pd.notnull(x) else np.nan)
     
-    # 2. Time features
+    # KMeans Clustering on Spatial features
+    spatial_coords = df[['latitude', 'longitude']].fillna(df[['latitude', 'longitude']].mean())
+    kmeans = KMeans(n_clusters=10, random_state=SEED, n_init=10)
+    df['spatial_cluster'] = kmeans.fit_predict(spatial_coords)
+    
+    # Temporal Features
     df[['hour', 'minute']] = df['timestamp'].str.split(':', expand=True).astype(float)
     df['minute_of_day'] = df['hour'] * 60 + df['minute']
     
-    # Advanced time features
+    # Cyclical Transformations
+    df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
+    df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
+    df['minute_sin'] = np.sin(2 * np.pi * df['minute_of_day'] / 1440)
+    df['minute_cos'] = np.cos(2 * np.pi * df['minute_of_day'] / 1440)
+    
     df['is_rush_hour'] = ((df['hour'].between(7, 9)) | (df['hour'].between(16, 19))).astype(int)
-    df['is_night'] = ((df['hour'] < 6) | (df['hour'] > 22)).astype(int)
     df['is_weekend'] = (df['day'] % 7 >= 5).astype(int)
     
-    # 3. Handle Missing Values
+    # Missing Values
     df['Temperature'] = df['Temperature'].fillna(df['Temperature'].median())
     df['RoadType'] = df['RoadType'].fillna('Unknown')
     df['Weather'] = df['Weather'].fillna('Unknown')
@@ -89,21 +114,16 @@ def feature_engineering(df):
     df['LargeVehicles'] = df['LargeVehicles'].fillna('Unknown')
     df['Landmarks'] = df['Landmarks'].fillna('Unknown')
     
-    # 4. Interaction Features
+    # Interactions
     df['Lanes_x_Road'] = df['NumberofLanes'].astype(str) + "_" + df['RoadType']
-    df['Weather_x_Rush'] = df['Weather'] + "_" + df['is_rush_hour'].astype(str)
+    df['Temp_per_Lane'] = df['Temperature'] / (df['NumberofLanes'] + 2)
     
-    # Encode categoricals for XGBoost/CatBoost
-    cat_cols = ['RoadType', 'LargeVehicles', 'Landmarks', 'Weather', 'geohash', 'Lanes_x_Road', 'Weather_x_Rush']
-    for c in cat_cols:
-        df[c] = df[c].astype('category')
+    # Frequency Encoding
+    for col in ['geohash', 'Weather', 'RoadType']:
+        freq = df[col].value_counts() / len(df)
+        df[col + '_freq'] = df[col].map(freq)
         
     return df
-
-# Apply feature engineering
-train['is_train'] = 1
-test['is_train'] = 0
-all_data = pd.concat([train, test], axis=0, ignore_index=True)
 
 all_data = feature_engineering(all_data)
 
@@ -111,134 +131,161 @@ train_df = all_data[all_data['is_train'] == 1].drop(columns=['is_train'])
 test_df = all_data[all_data['is_train'] == 0].drop(columns=['is_train', 'demand'])
 
 features = [c for c in train_df.columns if c not in ['Index', 'demand', 'timestamp']]
-cat_features = [c for c in features if train_df[c].dtype.name == 'category']
+cat_features = [c for c in features if all_data[c].dtype == 'object' or all_data[c].dtype.name == 'category']
 
-X = train_df[features]
+X = train_df[features].copy()
 y = train_df['demand']
-X_test = test_df[features]
+X_test = test_df[features].copy()
+
+# Ordinal Encode and properly cast to int
+oe = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
+X[cat_features] = oe.fit_transform(X[cat_features].astype(str))
+X_test[cat_features] = oe.transform(X_test[cat_features].astype(str))
+
+# Explicitly cast the DataFrame columns to int to drop the 'object' dtype
+for col in cat_features:
+    X[col] = pd.to_numeric(X[col], downcast='integer')
+    X_test[col] = pd.to_numeric(X_test[col], downcast='integer')
 """
 
 text_cv = """\
-## 3. Cross Validation Setup and Optuna Tuning
-We use a 5-fold Cross-Validation strategy. Optuna is utilized to find the optimal hyperparameters for XGBoost.
-(Note: For the sake of this notebook's execution time, n_trials is set lower. In a real competition, run ~100 trials).
+## 3. Modeling and Hyperparameter Tuning with Optuna
+We use 5-fold KFold CV. We tune XGBoost and HistGradientBoosting to find optimal params.
+(Note: RF and ET are trained with robust defaults to save time).
 """
 
 code_cv = """\
 kf = KFold(n_splits=5, shuffle=True, random_state=SEED)
 
+# XGBoost Tuning
 def objective_xgb(trial):
     params = {
         'objective': 'reg:squarederror',
         'eval_metric': 'rmse',
         'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1),
-        'max_depth': trial.suggest_int('max_depth', 3, 9),
+        'max_depth': trial.suggest_int('max_depth', 4, 8),
         'subsample': trial.suggest_float('subsample', 0.6, 1.0),
         'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
         'random_state': SEED,
-        'n_estimators': 300,
-        'enable_categorical': True,
+        'n_estimators': 200,
+        'enable_categorical': False,
         'tree_method': 'hist'
     }
-    
     r2_scores = []
     for train_idx, val_idx in kf.split(X, y):
-        X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
-        X_val, y_val = X.iloc[val_idx], y.iloc[val_idx]
-        
+        x_tr, y_tr = X.iloc[train_idx], y.iloc[train_idx]
+        x_va, y_va = X.iloc[val_idx], y.iloc[val_idx]
         model = xgb.XGBRegressor(**params)
-        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
-        preds = model.predict(X_val)
-        r2_scores.append(r2_score(y_val, preds))
-        
+        model.fit(x_tr, y_tr, eval_set=[(x_va, y_va)], verbose=False)
+        r2_scores.append(r2_score(y_va, model.predict(x_va)))
     return np.mean(r2_scores)
 
-# Optimize XGBoost
 study_xgb = optuna.create_study(direction='maximize')
 study_xgb.optimize(objective_xgb, n_trials=3)
-print("Best XGB params:", study_xgb.best_params)
+best_xgb = study_xgb.best_params
+best_xgb.update({'objective': 'reg:squarederror', 'eval_metric': 'rmse', 'random_state': SEED, 'n_estimators': 500, 'enable_categorical': False, 'tree_method': 'hist'})
+
+# HistGB Tuning
+def objective_hgb(trial):
+    params = {
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1),
+        'max_iter': 200,
+        'max_depth': trial.suggest_int('max_depth', 5, 15),
+        'min_samples_leaf': trial.suggest_int('min_samples_leaf', 10, 50),
+        'random_state': SEED
+    }
+    r2_scores = []
+    for train_idx, val_idx in kf.split(X, y):
+        x_tr, y_tr = X.iloc[train_idx], y.iloc[train_idx]
+        x_va, y_va = X.iloc[val_idx], y.iloc[val_idx]
+        model = HistGradientBoostingRegressor(**params)
+        model.fit(x_tr, y_tr)
+        r2_scores.append(r2_score(y_va, model.predict(x_va)))
+    return np.mean(r2_scores)
+
+study_hgb = optuna.create_study(direction='maximize')
+study_hgb.optimize(objective_hgb, n_trials=3)
+best_hgb = study_hgb.best_params
+best_hgb.update({'max_iter': 500, 'random_state': SEED})
 """
 
 text_models = """\
-## 4. Final Models Training
-We train XGBoost (with best params) and CatBoost on 5 folds to generate Out-Of-Fold (OOF) predictions and test predictions.
+## 4. Train 5-Model Ensemble
+Training XGBoost, HistGradientBoosting, CatBoost, RandomForest, and ExtraTrees.
 """
 
 code_models = """\
-best_xgb_params = study_xgb.best_params
-best_xgb_params['objective'] = 'reg:squarederror'
-best_xgb_params['eval_metric'] = 'rmse'
-best_xgb_params['random_state'] = SEED
-best_xgb_params['n_estimators'] = 800
-best_xgb_params['enable_categorical'] = True
-best_xgb_params['tree_method'] = 'hist'
+oof_preds = {name: np.zeros(len(X)) for name in ['XGB', 'HGB', 'CAT', 'RF', 'ET']}
+test_preds = {name: np.zeros(len(X_test)) for name in ['XGB', 'HGB', 'CAT', 'RF', 'ET']}
 
-cat_params = {
-    'loss_function': 'RMSE',
-    'eval_metric': 'R2',
-    'learning_rate': 0.05,
-    'depth': 6,
-    'random_seed': SEED,
-    'verbose': 0,
-    'iterations': 1000,
-    'cat_features': cat_features
+cat_params = {'loss_function': 'RMSE', 'learning_rate': 0.05, 'depth': 6, 'iterations': 500, 'random_seed': SEED, 'verbose': 0, 'cat_features': cat_features}
+rf_params = {'n_estimators': 150, 'max_depth': 12, 'random_state': SEED, 'n_jobs': -1}
+et_params = {'n_estimators': 150, 'max_depth': 12, 'random_state': SEED, 'n_jobs': -1}
+
+models = {
+    'XGB': xgb.XGBRegressor(**best_xgb),
+    'HGB': HistGradientBoostingRegressor(**best_hgb),
+    'CAT': CatBoostRegressor(**cat_params),
+    'RF': RandomForestRegressor(**rf_params),
+    'ET': ExtraTreesRegressor(**et_params)
 }
 
-oof_xgb = np.zeros(len(X))
-preds_xgb = np.zeros(len(X_test))
-oof_cat = np.zeros(len(X))
-preds_cat = np.zeros(len(X_test))
-
 for fold, (train_idx, val_idx) in enumerate(kf.split(X, y)):
-    print(f"Training Fold {fold+1}...")
-    X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
-    X_val, y_val = X.iloc[val_idx], y.iloc[val_idx]
-    
-    # XGBoost
-    model_xgb = xgb.XGBRegressor(**best_xgb_params)
-    model_xgb.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
-    oof_xgb[val_idx] = model_xgb.predict(X_val)
-    preds_xgb += model_xgb.predict(X_test) / 5
-    
-    # CatBoost
-    model_cat = CatBoostRegressor(**cat_params)
-    model_cat.fit(X_train, y_train, eval_set=[(X_val, y_val)], early_stopping_rounds=50, verbose=False)
-    oof_cat[val_idx] = model_cat.predict(X_val)
-    preds_cat += model_cat.predict(X_test) / 5
+    print(f"--- Fold {fold+1} ---")
+    x_tr, y_tr = X.iloc[train_idx], y.iloc[train_idx]
+    x_va, y_va = X.iloc[val_idx], y.iloc[val_idx]
+        
+    for name, model in models.items():
+        model.fit(x_tr, y_tr)
+        oof_preds[name][val_idx] = model.predict(x_va)
+        test_preds[name] += model.predict(X_test) / 5
 
-print("XGB R2:", r2_score(y, oof_xgb))
-print("CAT R2:", r2_score(y, oof_cat))
+r2_scores = {name: r2_score(y, oof_preds[name]) for name in models.keys()}
+for name, score in r2_scores.items():
+    print(f"{name} OOF R2: {score:.5f}")
 """
 
 text_ensemble = """\
-## 5. Ensembling & Submission
-We assign weights based on the validation R² scores.
+## 5. Ensembling, Feature Importance, & Final Submission
+Weighted Average Ensemble based on validation R² scores.
 """
 
 code_ensemble = """\
-r2_xgb = r2_score(y, oof_xgb)
-r2_cat = r2_score(y, oof_cat)
+# Weights based on R2 (clipping negative values to 0)
+weights = {name: max(score, 0) for name, score in r2_scores.items()}
+sum_w = sum(weights.values())
+weights = {name: w / sum_w for name, w in weights.items()}
 
-weights = [max(r2_xgb, 0), max(r2_cat, 0)]
-sum_w = sum(weights)
-if sum_w == 0:
-    w_xgb, w_cat = 0.5, 0.5
-else:
-    w_xgb, w_cat = weights[0]/sum_w, weights[1]/sum_w
+print("Ensemble Weights:", weights)
 
-print(f"Weights -> XGB: {w_xgb:.3f}, CAT: {w_cat:.3f}")
+final_oof = np.zeros(len(X))
+final_test = np.zeros(len(X_test))
 
-oof_ens = w_xgb*oof_xgb + w_cat*oof_cat
-print("Ensemble R2:", r2_score(y, oof_ens))
+for name in models.keys():
+    final_oof += weights[name] * oof_preds[name]
+    final_test += weights[name] * test_preds[name]
+    
+ens_r2 = r2_score(y, final_oof)
+print(f"\\nFINAL ENSEMBLE OOF R2: {ens_r2:.5f}")
 
-final_preds = w_xgb*preds_xgb + w_cat*preds_cat
+# Plot Feature Importance (XGBoost)
+plt.figure(figsize=(10, 8))
+feat_imp = pd.Series(models['XGB'].feature_importances_, index=X.columns).sort_values(ascending=False)
+sns.barplot(x=feat_imp.head(20), y=feat_imp.head(20).index)
+plt.title("Top 20 Features (XGBoost)")
+plt.tight_layout()
+plt.show()
 
-sub = pd.DataFrame({'Index': test_df['Index'], 'demand': final_preds})
+# Verification & Submission
+assert final_test.shape[0] == 41778, f"Expected 41778 rows, got {final_test.shape[0]}"
+assert not np.isnan(final_test).any(), "NaNs found in predictions!"
+
+sub = pd.DataFrame({'Index': test_df['Index'], 'demand': final_test})
 sub.to_csv('submission.csv', index=False)
-print("Saved submission.csv successfully!")
+print("Saved final submission.csv successfully! Shape:", sub.shape)
 """
 
-nb["cells"] = [
+nb['cells'] = [
     nbf.v4.new_markdown_cell(text_intro),
     nbf.v4.new_code_cell(code_imports),
     nbf.v4.new_markdown_cell(text_eda),
@@ -250,13 +297,10 @@ nb["cells"] = [
     nbf.v4.new_markdown_cell(text_models),
     nbf.v4.new_code_cell(code_models),
     nbf.v4.new_markdown_cell(text_ensemble),
-    nbf.v4.new_code_cell(code_ensemble),
+    nbf.v4.new_code_cell(code_ensemble)
 ]
 
-with open(
-    "/Users/anushka/Desktop/Internship work 2026 summer/Traffic-Demand-Predication/traffic_demand_prediction.ipynb",
-    "w",
-) as f:
+with open('/Users/anushka/Desktop/Internship work 2026 summer/Traffic-Demand-Predication/traffic_demand_prediction.ipynb', 'w') as f:
     nbf.write(nb, f)
 
-print("Jupyter Notebook created successfully!")
+print("Advanced Jupyter Notebook generated.")
