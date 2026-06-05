@@ -238,7 +238,7 @@ sub.to_csv('submission.csv', index=False)
 print("Saved submission.csv successfully!")
 """
 
-nb['cells'] = [
+nb["cells"] = [
     nbf.v4.new_markdown_cell(text_intro),
     nbf.v4.new_code_cell(code_imports),
     nbf.v4.new_markdown_cell(text_eda),
@@ -250,10 +250,13 @@ nb['cells'] = [
     nbf.v4.new_markdown_cell(text_models),
     nbf.v4.new_code_cell(code_models),
     nbf.v4.new_markdown_cell(text_ensemble),
-    nbf.v4.new_code_cell(code_ensemble)
+    nbf.v4.new_code_cell(code_ensemble),
 ]
 
-with open('/Users/anushka/Desktop/Internship work 2026 summer/Traffic-Demand-Predication/traffic_demand_prediction.ipynb', 'w') as f:
+with open(
+    "/Users/anushka/Desktop/Internship work 2026 summer/Traffic-Demand-Predication/traffic_demand_prediction.ipynb",
+    "w",
+) as f:
     nbf.write(nb, f)
 
 print("Jupyter Notebook created successfully!")
